@@ -4,7 +4,7 @@
 [![PyPI - Version](https://img.shields.io/pypi/v/strands-research-agent)](https://pypi.org/project/strands-research-agent/)
 [![Python Version](https://img.shields.io/pypi/pyversions/strands-research-agent)](https://pypi.org/project/strands-research-agent/)
 
-A production-ready autonomous research agent demonstrating advanced Strands Agents patterns including hot-reloading tools, multi-agent coordination, and persistent learning systems for enterprise research automation.
+Autonomous research agent demonstrating advanced Strands Agents patterns including hot-reloading tools, multi-agent coordination, and persistent learning systems for enterprise research automation.
 
 ## Feature Overview
 
