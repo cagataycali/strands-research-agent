@@ -5,10 +5,11 @@ It helps with dynamic adaptation of the agent's behavior and capabilities.
 
 Key Features:
 1. View current system prompt from any environment variable
-2. Update system prompt (in-memory)
+2. Update system prompt (in-memory and .prompt file)
 3. Add context information to system prompt
 4. Reset system prompt to default
 5. Support for custom variable names (SYSTEM_PROMPT, TOOL_BUILDER_SYSTEM_PROMPT, etc.)
+6. Simple current directory .prompt file storage (consistent with FileSessionManager)
 
 Usage Examples:
 ```python
@@ -36,34 +37,46 @@ result = agent.tool.system_prompt(
 
 import os
 from pathlib import Path
+
 from strands import tool
 
 
 def _get_prompt_file_path() -> Path:
-    """Get the appropriate .prompt file path."""
-    # Check current directory first
-    current_dir_prompt = Path(".prompt")
-    if current_dir_prompt.exists():
-        return current_dir_prompt
-    
-    # Check /tmp/.research/ directory
-    research_dir_prompt = Path("/tmp/.research/.prompt")
-    if research_dir_prompt.exists():
-        return research_dir_prompt
-    
-    # Default to current directory if neither exists
-    return current_dir_prompt
+    """Get the .prompt file path in current directory.
+
+    Simplified to only use current directory .prompt file for consistency
+    with FileSessionManager approach - no temp directory fallback.
+    """
+    return Path(".prompt")
 
 
 def _write_prompt_file(prompt: str) -> None:
-    """Write prompt to .prompt file."""
+    """Write prompt to .prompt file in current directory.
+
+    Uses secure file creation to prevent race conditions
+    and ensures proper permissions are set.
+    """
     prompt_file = _get_prompt_file_path()
-    
-    # Ensure parent directory exists
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Write prompt to file
-    prompt_file.write_text(prompt, encoding="utf-8")
+
+    # Use secure file creation pattern to prevent race conditions
+    try:
+        # Create file with restrictive permissions (owner read/write only)
+        with open(
+            prompt_file,
+            "w",
+            encoding="utf-8",
+            opener=lambda path, flags: os.open(path, flags, 0o600),
+        ) as f:
+            f.write(prompt)
+    except (OSError, PermissionError):
+        # If secure creation fails, fall back to regular creation
+        # but still try to set restrictive permissions
+        try:
+            prompt_file.write_text(prompt, encoding="utf-8")
+            prompt_file.chmod(0o600)  # Set restrictive permissions after creation
+        except (OSError, PermissionError):
+            # If we can't set permissions, at least write the file
+            prompt_file.write_text(prompt, encoding="utf-8")
 
 
 def _get_system_prompt(variable_name: str = "SYSTEM_PROMPT") -> str:
@@ -84,7 +97,7 @@ def _update_system_prompt(
     """Update the system prompt in both environment variable and .prompt file."""
     # Update in-memory environment variable
     os.environ[variable_name] = new_prompt
-    
+
     # Also write to .prompt file for persistence across sessions
     # Only write to file for the default SYSTEM_PROMPT variable to avoid conflicts
     if variable_name == "SYSTEM_PROMPT":
@@ -138,7 +151,7 @@ def system_prompt(
     try:
         if action == "view":
             current_prompt = _get_system_prompt(variable_name)
-            
+
             return {
                 "status": "success",
                 "content": [
@@ -170,11 +183,7 @@ def system_prompt(
 
             return {
                 "status": "success",
-                "content": [
-                    {
-                        "text": message
-                    }
-                ],
+                "content": [{"text": message}],
             }
 
         elif action == "add_context":
@@ -200,31 +209,29 @@ def system_prompt(
 
             return {
                 "status": "success",
-                "content": [
-                    {
-                        "text": message
-                    }
-                ],
+                "content": [{"text": message}],
             }
 
         elif action == "reset":
             # Reset environment variable
             os.environ.pop(variable_name, None)
-            
+
             # Also clear .prompt file for SYSTEM_PROMPT variable
             if variable_name == "SYSTEM_PROMPT":
                 prompt_file = _get_prompt_file_path()
                 if prompt_file.exists():
-                    prompt_file.unlink()  # Delete the file
+                    try:
+                        prompt_file.unlink()  # Delete the file
+                    except (OSError, PermissionError):
+                        # If we can't delete the file, it's not critical
+                        pass
                 message = f"System prompt reset to default (env: {variable_name}, file: .prompt cleared)"
             else:
                 message = f"System prompt reset to default (env: {variable_name})"
 
             return {
                 "status": "success",
-                "content": [
-                    {"text": message}
-                ],
+                "content": [{"text": message}],
             }
 
         else:

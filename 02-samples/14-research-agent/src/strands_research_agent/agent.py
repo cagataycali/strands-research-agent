@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-import time
-import socket
 import argparse
 import base64
-import os
-import sys
 import datetime
 import json
-from typing import Any
-import uuid
+import os
+import socket
+import sys
+import time
 from pathlib import Path
+from typing import Any
 
-from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp import stdio_client, StdioServerParameters
-from strands.telemetry import StrandsTelemetry
+from mcp import StdioServerParameters, stdio_client
 from prompt_toolkit import prompt
-from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.history import FileHistory
+from strands import Agent
+from strands.session.file_session_manager import FileSessionManager
+from strands.telemetry import StrandsTelemetry
+from strands.tools.mcp import MCPClient
 from strands_tools.utils.models.model import create_model
+
 from strands_research_agent.handlers.callback_handler import callback_handler
 
 hostname = socket.gethostname()
@@ -28,16 +29,15 @@ instance_id = f"research-agent-{hostname}-{timestamp[-6:]}"
 
 
 def read_prompt_file():
-    """Read system prompt text from .prompt file if it exists (repo or /tmp/.research/.prompt)."""
+    """Read system prompt text from .prompt file if it exists."""
     prompt_paths = [
         Path(".prompt"),
-        Path("/tmp/.research/.prompt"),
         Path("README.md"),
     ]
     for path in prompt_paths:
         if path.is_file():
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     return f.read(), str(path)
             except Exception:
                 continue
@@ -46,8 +46,12 @@ def read_prompt_file():
 
 def get_shell_history_file():
     """Get the research-specific history file path."""
-    # Use /tmp/.research_history as requested
-    research_history = Path("/tmp/.research_history")
+    research_history = Path.home() / ".research_history"
+
+    # Create with secure permissions if it doesn't exist
+    if not research_history.exists():
+        research_history.touch(mode=0o600)
+
     return str(research_history)
 
 
@@ -55,8 +59,8 @@ def get_shell_history_files():
     """Get available shell history file paths."""
     history_files = []
 
-    # research history (primary)
-    research_history = Path("/tmp/.research_history")
+    # research history (primary) - now in secure temp directory
+    research_history = Path(get_shell_history_file())
     if research_history.exists():
         history_files.append(("research", str(research_history)))
 
@@ -77,25 +81,28 @@ def extract_commands_from_history():
     """Extract commonly used commands from shell history for auto-completion."""
     commands = set()
     history_files = get_shell_history_files()
-    
+
     # Limit the number of recent commands to process for performance
     max_recent_commands = 100
-    
+
     for history_type, history_file in history_files:
         try:
-            with open(history_file, "r", encoding="utf-8") as f:
+            with open(history_file, encoding="utf-8") as f:
                 lines = f.readlines()
-            
+
             # Take recent commands for better relevance
-            recent_lines = lines[-max_recent_commands:] if len(lines) > max_recent_commands else lines
-            
+            recent_lines = (
+                lines[-max_recent_commands:]
+                if len(lines) > max_recent_commands
+                else lines
+            )
+
             for line in recent_lines:
                 line = line.strip()
                 if not line:
                     continue
-                    
-                command = None
-                
+
+
                 if history_type == "research":
                     # Extract research commands
                     if "# research:" in line:
@@ -103,11 +110,13 @@ def extract_commands_from_history():
                             query = line.split("# research:")[-1].strip()
                             # Extract first word as command
                             first_word = query.split()[0] if query.split() else None
-                            if first_word and len(first_word) > 2:  # Only meaningful commands
+                            if (
+                                first_word and len(first_word) > 2
+                            ):  # Only meaningful commands
                                 commands.add(first_word.lower())
                         except (ValueError, IndexError):
                             continue
-                            
+
                 elif history_type == "zsh":
                     # Zsh format: ": timestamp:0;command"
                     if line.startswith(": ") and ":0;" in line:
@@ -116,22 +125,28 @@ def extract_commands_from_history():
                             if len(parts) == 2:
                                 full_command = parts[1].strip()
                                 # Extract first word as command
-                                first_word = full_command.split()[0] if full_command.split() else None
-                                if first_word and len(first_word) > 1:  # Only meaningful commands
+                                first_word = (
+                                    full_command.split()[0]
+                                    if full_command.split()
+                                    else None
+                                )
+                                if (
+                                    first_word and len(first_word) > 1
+                                ):  # Only meaningful commands
                                     commands.add(first_word.lower())
                         except (ValueError, IndexError):
                             continue
-                            
+
                 elif history_type == "bash":
                     # Bash format: simple command per line
                     first_word = line.split()[0] if line.split() else None
                     if first_word and len(first_word) > 1:  # Only meaningful commands
                         commands.add(first_word.lower())
-                        
-        except Exception as e:
+
+        except Exception:
             # Skip files that can't be read
             continue
-    
+
     return list(commands)
 
 
@@ -195,144 +210,6 @@ def parse_history_line(line, history_type):
     return None
 
 
-def get_distributed_events(agent):
-    """Get recent distributed events using the event_bridge tool."""
-    try:
-        # Check if event_bridge tool is available
-        if not hasattr(agent.tool, "event_bridge"):
-            return
-
-        # Get distributed event count from environment variable, default to 25
-        event_count = int(os.getenv("RESEARCH_DISTRIBUTED_EVENT_COUNT", "25"))
-
-        # Subscribe to distributed events using the event_bridge tool
-        agent.tool.event_bridge(action="subscribe", limit=event_count)
-
-    except Exception as e:
-        # Silently fail if distributed events can't be fetched
-        return
-
-
-def publish_conversation_turn(agent, query, response, event_type="conversation_turn"):
-    """Publish a conversation turn to the distributed event bridge."""
-    message_count = int(os.getenv("RESEARCH_LAST_MESSAGE_COUNT", "200"))
-    
-    try:
-        # Check if event_bridge tool is available
-        if not hasattr(agent.tool, "event_bridge"):
-            return
-
-        # Create a summary of the conversation turn
-        response_summary = (
-            str(response).replace("\n", " ")[:message_count] + "..."
-            if len(str(response)) > message_count
-            else str(response)
-        )
-
-        message = f"Q: {query}\nA: {response_summary}"
-
-        # Publish the event using the event_bridge tool
-        agent.tool.event_bridge(
-            action="publish",
-            message=message,
-            event_type=event_type,
-            record_direct_tool_call=False,
-        )
-
-    except Exception as e:
-        # Silently fail if event publishing fails
-        pass
-
-
-def get_messages_dir():
-    """Get the research messages directory path."""
-    messages_dir = Path("/tmp/.research")
-    messages_dir.mkdir(exist_ok=True)
-    return messages_dir
-
-
-def get_session_file():
-    """Get or create session file path."""
-    messages_dir = get_messages_dir()
-
-    # Generate session ID based on date and UUID
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    session_id = str(uuid.uuid4())[:8]  # Short UUID
-
-    session_file = messages_dir / f"{today}-{session_id}.json"
-    return str(session_file)
-
-
-def save_agent_messages(agent, session_file):
-    """Save agent.messages to JSON file."""
-    try:
-        # Convert messages to serializable format
-        messages_data = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "messages": [],
-        }
-
-        # Handle different message formats
-        for msg in agent.messages:
-            if hasattr(msg, "to_dict"):
-                # If message has to_dict method
-                messages_data["messages"].append(msg.to_dict())
-            elif hasattr(msg, "__dict__"):
-                # If message is an object with attributes
-                msg_dict = {}
-                for key, value in msg.__dict__.items():
-                    try:
-                        # Try to serialize the value
-                        json.dumps(value)
-                        msg_dict[key] = value
-                    except (TypeError, ValueError):
-                        # If not serializable, convert to string
-                        msg_dict[key] = str(value)
-                messages_data["messages"].append(msg_dict)
-            else:
-                # Fallback: convert to string
-                messages_data["messages"].append(str(msg))
-
-        # Write to file
-        with open(session_file, "w", encoding="utf-8") as f:
-            json.dump(messages_data, f, indent=2, ensure_ascii=False)
-
-    except Exception as e:
-        # Silently fail if we can't save messages
-        print(f"⚠️  Warning: Could not save messages: {e}")
-
-
-def get_sqlite_memory_context(agent, user_query):
-    """Get relevant context from SQLite memory based on user query."""
-    try:
-        if not hasattr(agent.tool, "sqlite_memory"):
-            return ""
-
-        # Search for relevant memories using full-text search
-        result = agent.tool.sqlite_memory(
-            action="search",
-            query=user_query,
-            search_type="fulltext",
-            limit=5,
-            record_direct_tool_call=False,
-        )
-
-        if "No memories found" in str(result):
-            return ""
-
-        # Extract and format context from memories
-        context = "\n\n## 🧠 Relevant Memory Context:\n"
-        context += (
-            "Based on your query, here are relevant past conversations and knowledge:\n"
-        )
-        context += str(result) + "\n"
-
-        return context
-    except Exception as e:
-        # Silently fail if memory search fails
-        return ""
-
-
 def get_retrieve_context(agent, user_query):
     """Get relevant context from Bedrock Knowledge Base using retrieve tool."""
     try:
@@ -361,13 +238,13 @@ def get_retrieve_context(agent, user_query):
         context += str(result) + "\n"
 
         return context
-    except Exception as e:
+    except Exception:
         # Silently fail if knowledge retrieval fails
         return ""
 
 
 def get_last_messages(agent=None, user_query=""):
-    """Get the last N messages from multiple shell histories, distributed events, and SQLite memory for context."""
+    """Get the last N messages from multiple shell histories, distributed events for context."""
     try:
         # Get message count from environment variable, default to 200
         message_count = int(os.getenv("RESEARCH_LAST_MESSAGE_COUNT", "200"))
@@ -379,7 +256,7 @@ def get_last_messages(agent=None, user_query=""):
 
         for history_type, history_file in history_files:
             try:
-                with open(history_file, "r", encoding="utf-8") as f:
+                with open(history_file, encoding="utf-8") as f:
                     lines = f.readlines()
 
                 # For bash history, only take recent lines since there are no timestamps
@@ -391,17 +268,9 @@ def get_last_messages(agent=None, user_query=""):
                     parsed = parse_history_line(line, history_type)
                     if parsed:
                         all_entries.append(parsed)
-            except Exception as e:
+            except Exception:
                 # Skip files that can't be read
                 continue
-
-        # Get distributed events if agent is available
-        if agent:
-            try:
-                get_distributed_events(agent)
-            except Exception as e:
-                # Skip distributed events if they can't be fetched
-                pass
 
         # Take the last N entries
         recent_entries = (
@@ -418,11 +287,7 @@ def get_last_messages(agent=None, user_query=""):
             for speaker, timestamp, content in recent_entries:
                 context += f"[{timestamp}] {speaker}: {content}\n"
 
-        # Add SQLite memory context if user query is provided
         if agent and user_query:
-            memory_context = get_sqlite_memory_context(agent, user_query)
-            context += memory_context
-
             # Add retrieve context from knowledge base if available
             retrieve_context = get_retrieve_context(agent, user_query)
             context += retrieve_context
@@ -431,38 +296,6 @@ def get_last_messages(agent=None, user_query=""):
 
     except Exception:
         return ""
-
-
-def store_conversation_in_sqlite_memory(agent, query, result):
-    """Store conversation turn in SQLite memory for future retrieval."""
-    try:
-        if not hasattr(agent.tool, "sqlite_memory"):
-            return
-
-        # Create conversation content by combining user input and agent result
-        conversation_content = f"User Query: {query}\n\nAgent Response: {str(result)}"
-
-        # Create title with research prefix, current date, and user query (truncated)
-        query_preview = query[:50] + "..." if len(query) > 50 else query
-        conversation_title = f"Research Conversation: {datetime.datetime.now().strftime('%Y-%m-%d')} | {query_preview}"
-
-        # Store in SQLite memory with relevant tags
-        agent.tool.sqlite_memory(
-            action="store",
-            content=conversation_content,
-            title=conversation_title,
-            tags=["conversation", "research", "user_interaction"],
-            metadata={
-                "query_length": len(query),
-                "response_length": len(str(result)),
-                "timestamp": datetime.datetime.now().isoformat(),
-                "session_id": instance_id,
-            },
-            record_direct_tool_call=False,
-        )
-    except Exception as e:
-        # Silently fail if storage fails
-        pass
 
 
 def store_conversation_in_kb(agent, query, result):
@@ -490,9 +323,130 @@ def store_conversation_in_kb(agent, query, result):
             knowledge_base_id=knowledge_base_id,
             record_direct_tool_call=False,
         )
-    except Exception as e:
+    except Exception:
         # Silently fail if knowledge base storage fails
         pass
+
+
+def construct_system_prompt(recent_context="", user_query=""):
+    """Construct the system prompt with all necessary components.
+
+    Args:
+        recent_context: Recent conversation context string
+        user_query: Current user query for context (optional)
+
+    Returns:
+        str: Complete system prompt
+    """
+    # Enhanced system prompt with history context and self-modification instructions
+    base_prompt = "i'm research. minimalist agent. welcome to chat."
+
+    # Read .prompt or secure temp/.prompt if present
+    prompt_file_content, prompt_file_path = read_prompt_file()
+    if prompt_file_content and prompt_file_path:
+        prompt_file_note = f"\n\n[Loaded system prompt from: {prompt_file_path}]\n{prompt_file_content}\n"
+    else:
+        prompt_file_note = ""
+
+    # Runtime and Environment Information
+    runtime_info = f"""
+
+## 🚀 Runtime Environment:
+- **Current Directory:** {Path.cwd()}
+- **Python Version:** {sys.version.split()[0]}
+- **Platform:** {os.name} ({sys.platform})
+- **User:** {os.getenv('USER', 'unknown')}
+- **Hostname:** {socket.gethostname()}
+- **Session ID:** {instance_id}
+- **Timestamp:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- **Context awareness** - Agent has access to historical conversations and knowledge
+
+**Note:** Tool availability depends on RESEARCH_STRANDS_TOOLS environment variable. Current filter: {os.getenv('RESEARCH_STRANDS_TOOLS', 'ALL')}
+
+## Tool Creation & Hot Reload System:
+### **CRITICAL: You have FULL tool creation capabilities enabled!**
+
+**🔧 Hot Reload System Active:**
+- **Instant Tool Creation** - Save any .py file in `./tools/` and it becomes immediately available
+- **No Restart Needed** - Tools are auto-loaded and ready to use instantly
+- **Live Development** - Modify existing tools while running and test immediately
+- **Full Python Access** - Create any Python functionality as a tool
+
+**🛠️ Tool Creation Patterns:**
+
+### **1. Simple @tool Decorator (Recommended):**
+```python
+# ./tools/my_tool.py
+from strands import tool
+
+@tool
+def calculate_tip(amount: float, percentage: float = 15.0) -> str:
+    \"\"\"Calculate tip and total for a bill.
+
+    Args:
+        amount: Bill amount in dollars
+        percentage: Tip percentage (default: 15.0)
+
+    Returns:
+        str: Formatted tip calculation result
+    \"\"\"
+    tip = amount * (percentage / 100)
+    total = amount + tip
+    return f"Tip: tip:.2f, Total: total:.2f"
+```
+
+### **2. Advanced Action-Based Pattern:**
+```python
+# ./tools/weather.py
+from typing import Dict, Any
+from strands import tool
+
+@tool
+def weather_tool(action: str, location: str = None, **kwargs) -> Dict[str, Any]:
+    \"\"\"Comprehensive weather information tool.
+
+    Args:
+        action: Action to perform (current, forecast, alerts)
+        location: City name (required)
+        **kwargs: Additional parameters
+
+    Returns:
+        Dict containing status and response content
+    \"\"\"
+    if action == "current":
+        return "status": "success", "content": "text": f"Weather for location"
+    elif action == "forecast":
+        return "status": "success", "content": "text": f"Forecast for location"
+    else:
+        return "status": "error", "content": "text": f"Unknown action: action"
+```
+
+**Response Format:**
+- Tool calls: **MAXIMUM PARALLELISM - ALWAYS**
+- Communication: **MINIMAL WORDS**
+- Efficiency: **Speed is paramount**
+"""
+
+    self_modify_note = (
+        "\n\nNote: The system prompt for research is built from your base instructions, "
+        "conversation history, and the .prompt file (in this directory or secure temp/.prompt). "
+        "You can modify the system prompt in multiple ways:\n"
+        "1. **Edit .prompt file** - Create/modify .prompt in current directory or secure temp/.prompt\n"
+        "2. **SYSTEM_PROMPT environment variable** - Set SYSTEM_PROMPT env var to extend the system prompt\n"
+        "3. **Environment tool** - Use environment(action='set', name='SYSTEM_PROMPT', value='additional text')\n"
+        "4. **Runtime modification** - The SYSTEM_PROMPT env var is appended to every system prompt automatically"
+    )
+
+    system_prompt = (
+        base_prompt
+        + recent_context
+        + prompt_file_note
+        + runtime_info
+        + self_modify_note
+        + os.getenv("SYSTEM_PROMPT", ".")
+    )
+
+    return system_prompt
 
 
 def append_to_shell_history(query, response):
@@ -502,7 +456,8 @@ def append_to_shell_history(query, response):
 
         # Format the entry for shell history
         # Use a comment format that's shell-compatible
-        timestamp = os.popen("date +%s").read().strip()
+        # Use a more secure way to get timestamp instead of shell command
+        timestamp = str(int(time.time()))
 
         with open(history_file, "a", encoding="utf-8") as f:
             # Add the query
@@ -516,7 +471,10 @@ def append_to_shell_history(query, response):
             )
             f.write(f": {timestamp}:0;# research_result: {response_summary}\n")
 
-    except Exception as e:
+        # Ensure secure permissions
+        os.chmod(history_file, 0o600)
+
+    except Exception:
         # Silently fail if we can't write to history
         pass
 
@@ -535,8 +493,12 @@ def setup_otel() -> None:
             ).decode()
             otel_endpoint = f"{otel_host}/api/public/otel"
 
-            os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", otel_endpoint)
-            os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", f"Authorization=Basic {auth_token}")
+            os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = os.environ.get(
+                "OTEL_EXPORTER_OTLP_ENDPOINT", otel_endpoint
+            )
+            os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = os.environ.get(
+                "OTEL_EXPORTER_OTLP_HEADERS", f"Authorization=Basic {auth_token}"
+            )
 
             strands_telemetry = StrandsTelemetry()
             strands_telemetry.setup_otlp_exporter()
@@ -568,67 +530,47 @@ def _get_all_tools() -> dict[str, Any]:
 
     try:
         # Strands tools
-        from strands_research_agent.tools import (
-            event_bridge,
-            tcp,
-            scraper,
-            tasks,
-            dialog,
-            graphql,
-            use_github,
-            fetch_github_tool,
-            s3_memory,
-            listen,
-            sqlite_memory,
-            store_in_kb,
-            system_prompt,
-            notify,
-        )
-
         from strands_tools import (
-            python_repl,
             calculator,
             current_time,
             editor,
             environment,
             file_read,
             file_write,
-            generate_image,
             http_request,
             image_reader,
             journal,
-            diagram,
-            mcp_client,
             load_tool,
-            memory,
-            nova_reels,
+            mcp_client,
+            python_repl,
             retrieve,
-            slack,
-            speak,
             shell,
             stop,
             swarm,
             think,
+            use_agent,
             use_aws,
             workflow,
-            use_agent,
+        )
+
+        from strands_research_agent.tools import (
+            notify,
+            scraper,
+            store_in_kb,
+            system_prompt,
+            tasks,
+            use_github,
         )
 
         tools = {
-            "listen": listen,
             "notify": notify,
             "store_in_kb": store_in_kb,
-            "graphql": graphql,
             "use_github": use_github,
-            "fetch_github_tool": fetch_github_tool,
-            "event_bridge": event_bridge,
-            "tcp": tcp,
             "use_agent": use_agent,
             "shell": shell,
             "scraper": scraper,
             "tasks": tasks,
             "environment": environment,
-            "dialog": dialog,
             "mcp_client": mcp_client,
             "python_repl": python_repl,
             "calculator": calculator,
@@ -636,20 +578,12 @@ def _get_all_tools() -> dict[str, Any]:
             "editor": editor,
             "file_read": file_read,
             "file_write": file_write,
-            "generate_image": generate_image,
             "http_request": http_request,
             "image_reader": image_reader,
             "journal": journal,
-            "diagram": diagram,
             "load_tool": load_tool,
             "system_prompt": system_prompt,
-            "s3_memory": s3_memory,
-            "sqlite_memory": sqlite_memory,
-            "memory": memory,
-            "nova_reels": nova_reels,
             "retrieve": retrieve,
-            "slack": slack,
-            "speak": speak,
             "stop": stop,
             "swarm": swarm,
             "think": think,
@@ -721,7 +655,7 @@ def _filter_tools(all_tools: dict[str, Any]) -> dict[str, Any]:
 
 def create_agent(model_provider="bedrock"):
     """
-    Create a Strands Agent with MCP integration.
+    Create a Strands Agent with MCP integration and file session persistence.
 
     Args:
         model_provider: Model provider, default bedrock (default: sonnet-4)
@@ -752,12 +686,21 @@ def create_agent(model_provider="bedrock"):
         print(f"⚠️  Warning: Could not load MCP tools: {e}")
         mcp_tools = []
 
-    # Create the agent with combined tools
+    # Create session manager with hourly session ID
+    today = datetime.datetime.now().strftime("%Y-%m-%d-%H")
+    session_id = f"research-{today}"
+
+    session_manager = FileSessionManager(
+        session_id=session_id, storage_dir=Path.cwd() / "sessions"
+    )
+
+    # Create the agent with combined tools and session manager
     agent = Agent(
         model=model,
         tools=list(tools.values()) + mcp_tools,
         callback_handler=callback_handler,
         load_tools_from_directory=True,
+        session_manager=session_manager,
         trace_attributes={
             "session.id": instance_id,
             "user.id": "strands-agent@users.noreply.github.com",
@@ -779,11 +722,13 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  research                              # Interactive mode
-  research hello world                  # Single query mode
-  research "what can you do"            # Single query with quotes
-  research "hello world" --interactive  # Query then stay interactive
-  research --version                    # Show version information
+  research-agent                                    # Interactive mode
+  research-agent hello world                        # Single query mode
+  research-agent "what can you do"                  # Single query with quotes
+  research-agent "hello world" --interactive        # Query then stay interactive
+  echo "analyze this data" | research-agent         # Piped input
+  INPUT_TASK="search papers" research-agent        # Environment variable
+  echo "task1" | INPUT_TASK="task2" research "task3"  # Multi-input (all 3 methods)
         """,
     )
 
@@ -822,161 +767,92 @@ def main():
 
     # Use MCP client context manager to keep MCP tools alive
     with mcp_client:
-        # Get recent conversation context (including distributed events and SQLite memory)
+        # Get recent conversation context (including distributed events)
         recent_context = get_last_messages(agent)
 
-        # Enhanced system prompt with history context and self-modification instructions
-        base_prompt = "i'm research agent. minimalist agent. welcome to chat."
-        # Read .prompt or /tmp/.research/.prompt if present
-        prompt_file_content, prompt_file_path = read_prompt_file()
-        if prompt_file_content and prompt_file_path:
-            prompt_file_note = f"\n\n[Loaded system prompt from: {prompt_file_path}]\n{prompt_file_content}\n"
-        else:
-            prompt_file_note = ""
+        # Construct and set the system prompt
+        agent.system_prompt = construct_system_prompt(recent_context)
 
-        # Runtime and Environment Information
-        runtime_info = f"""
+        # Multi-input task collection (similar to strands-action)
+        tasks = {}
+        has_piped_input = False
 
-## 🚀 Runtime Environment:
-- **Current Directory:** {Path.cwd()}
-- **Python Version:** {sys.version.split()[0]}
-- **Platform:** {os.name} ({sys.platform})
-- **User:** {os.getenv('USER', 'unknown')}
-- **Hostname:** {socket.gethostname()}
-- **Session ID:** {instance_id}
-- **Timestamp:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## 📚 Knowledge Base Integration:
-- **Dual storage** - Conversations stored in both SQLite memory and knowledge base
-- **Context awareness** - Agent has access to historical conversations and knowledge
-
-**Note:** Tool availability depends on RESEARCH_STRANDS_TOOLS environment variable. Current filter: {os.getenv('RESEARCH_STRANDS_TOOLS', 'ALL')}
-
-## Tool Creation & Hot Reload System:
-### **CRITICAL: You have FULL tool creation capabilities enabled!**
-
-**🔧 Hot Reload System Active:**
-- **Instant Tool Creation** - Save any .py file in `./tools/` and it becomes immediately available
-- **No Restart Needed** - Tools are auto-loaded and ready to use instantly
-- **Live Development** - Modify existing tools while running and test immediately
-- **Full Python Access** - Create any Python functionality as a tool
-
-**🛠️ Tool Creation Patterns:**
-
-### **1. Simple @tool Decorator (Recommended):**
-```python
-# ./tools/my_tool.py
-from strands import tool
-
-@tool
-def calculate_tip(amount: float, percentage: float = 15.0) -> str:
-    \"\"\"Calculate tip and total for a bill.
-    
-    Args:
-        amount: Bill amount in dollars
-        percentage: Tip percentage (default: 15.0)
-        
-    Returns:
-        str: Formatted tip calculation result
-    \"\"\"
-    tip = amount * (percentage / 100)
-    total = amount + tip
-    return f"Tip: tip:.2f, Total: total:.2f"
-```
-
-### **2. Advanced Action-Based Pattern:**
-```python
-# ./tools/weather.py
-from typing import Dict, Any
-from strands import tool
-
-@tool
-def weather_tool(action: str, location: str = None, **kwargs) -> Dict[str, Any]:
-    \"\"\"Comprehensive weather information tool.
-    
-    Args:
-        action: Action to perform (current, forecast, alerts)
-        location: City name (required)
-        **kwargs: Additional parameters
-        
-    Returns:
-        Dict containing status and response content
-    \"\"\"
-    if action == "current":
-        return "status": "success", "content": "text": f"Weather for location"
-    elif action == "forecast":
-        return "status": "success", "content": "text": f"Forecast for location"
-    else:
-        return "status": "error", "content": "text": f"Unknown action: action"
-```
-
-**Response Format:**
-- Tool calls: **MAXIMUM PARALLELISM - ALWAYS** 
-- Communication: **MINIMAL WORDS**
-- Efficiency: **Speed is paramount**
-"""
-        self_modify_note = (
-            "\n\nNote: The system prompt for research is built from your base instructions, "
-            "conversation history, and the .prompt file (in this directory or /tmp/.research/.prompt). "
-            "You can modify the system prompt in multiple ways:\n"
-            "1. **Edit .prompt file** - Create/modify .prompt in current directory or /tmp/.research/.prompt\n"
-            "2. **SYSTEM_PROMPT environment variable** - Set SYSTEM_PROMPT env var to extend the system prompt\n"
-            "3. **Environment tool** - Use environment(action='set', name='SYSTEM_PROMPT', value='additional text')\n"
-            "4. **Runtime modification** - The SYSTEM_PROMPT env var is appended to every system prompt automatically"
-        )
-
-        system_prompt = (
-            base_prompt
-            + recent_context
-            + prompt_file_note
-            + runtime_info
-            + self_modify_note
-            # add own codebase fs read here - should work even in package shared and downloaded over pypi or pipx
-            + os.getenv("SYSTEM_PROMPT", ".")
-        )
-
-        # Set system prompt
-        agent.system_prompt = system_prompt
-
-        # Get session file for storing messages
-        session_file = get_session_file()
-        print(f"📝 Session messages will be saved to: {session_file}")
-
-        # Check if query provided as arguments
-        if args.query:
-            # Single query mode - join all arguments as the query
-            query = " ".join(args.query)
-            print(f"\n# {query}")
-
+        # Priority 1: Check for piped input (stdin) - HIGHEST PRIORITY
+        if not sys.stdin.isatty():
             try:
-                result = agent(query)
-                append_to_shell_history(query, result)
-                save_agent_messages(agent, session_file)
-                # Store conversation in SQLite memory for future context retrieval
-                store_conversation_in_sqlite_memory(agent, query, result)
-                # Store conversation in knowledge base if available
-                store_conversation_in_kb(agent, query, result)
-                # Store conversation in knowledge base if kb exists and store_in_kb exists
-                # Publish conversation turn to distributed event bridge
-                publish_conversation_turn(agent, query, result)
-            except Exception as e:
-                print(f"❌ Error: {e}")
-                sys.exit(1)
+                pipe_task = sys.stdin.read().strip()
+                if pipe_task:
+                    tasks["pipe"] = pipe_task
+                    has_piped_input = True
+            except Exception:
+                # Handle case where stdin is closed or unavailable
+                pass
+
+        # Priority 2: Check command line arguments
+        if args.query:
+            cmd_task = " ".join(args.query)
+            if cmd_task:
+                tasks["command_line"] = cmd_task
+
+        # Priority 3: Environment variable INPUT_TASK (not TASK to avoid conflicts)
+        env_task = os.getenv("INPUT_TASK")
+        if env_task:
+            tasks["environment"] = env_task
+
+        # Execute collected tasks
+        if tasks:
+            task_list = list(tasks.values())
+            print(f"🚀 Found {len(task_list)} task(s) to execute:")
+            for source, task in tasks.items():
+                print(f"  - {source}: {task[:50]}{'...' if len(task) > 50 else ''}")
+            print()
+
+            # Process each task
+            for i, task in enumerate(task_list, 1):
+                print(f"\n# Task {i}/{len(task_list)}: {task}")
+
+                try:
+                    # Get updated context for each task
+                    recent_context = get_last_messages(agent, task)
+                    agent.system_prompt = construct_system_prompt(recent_context, task)
+
+                    result = agent(task)
+                    append_to_shell_history(task, result)
+                    store_conversation_in_kb(agent, task, result)
+                except Exception as e:
+                    print(f"❌ Error: {e}")
+                    if not args.interactive:
+                        sys.exit(1)
 
             # If --interactive flag is set, continue to interactive mode
             if not args.interactive:
                 return
 
+            # If we had piped input, we need to reset stdin for interactive mode
+            if has_piped_input:
+                # Reopen stdin to the terminal
+                try:
+                    sys.stdin = open("/dev/tty")
+                except Exception:
+                    print(
+                        "⚠️  Cannot enter interactive mode after piped input on this system."
+                    )
+                    return
+
         print("💡 Type 'exit', 'quit', or 'bye' to quit, or Ctrl+C")
 
-        # Set up prompt_toolkit with history
+        # Check if we can run interactive mode
+        if has_piped_input and not sys.stdin.isatty():
+            print("⚠️  Interactive mode may not work properly with piped input.")
+
+        # Set up prompt_toolkit with history in secure temp directory
         history_file = get_shell_history_file()
         history = FileHistory(history_file)
 
         # Create completions from common commands and shell history
         base_commands = ["exit", "quit", "bye", "help", "clear", "ls", "pwd", "cd"]
         history_commands = extract_commands_from_history()
-        
+
         # Combine base commands with commands from history
         all_commands = list(set(base_commands + history_commands))
         completer = WordCompleter(all_commands, ignore_case=True)
@@ -996,22 +872,10 @@ def weather_tool(action: str, location: str = None, **kwargs) -> Dict[str, Any]:
                 if q.startswith("!"):
                     shell_command = q[1:]  # Remove the ! prefix
                     try:
-                        # Execute shell command directly using the shell tool
-                        result = agent.tool.shell(
-                            command=shell_command, timeout=900, shell=True
-                        )
+                        result = agent.tool.shell(command=shell_command, timeout=900)
                         append_to_shell_history(q, result["content"][0]["text"])
-                        save_agent_messages(agent, session_file)
-                        # Store shell command in SQLite memory for future reference
-                        store_conversation_in_sqlite_memory(
-                            agent, q, result["content"][0]["text"]
-                        )
                         # Store shell command in knowledge base if available
                         store_conversation_in_kb(agent, q, result["content"][0]["text"])
-                        # Publish shell command to distributed event bridge
-                        publish_conversation_turn(
-                            agent, q, result["content"][0]["text"], "shell_command"
-                        )
                     except Exception as e:
                         print(f"Shell command execution error: {str(e)}")
                     continue
@@ -1023,51 +887,20 @@ def weather_tool(action: str, location: str = None, **kwargs) -> Dict[str, Any]:
                 if not q.strip():
                     continue
 
-                # Get recent conversation context (including distributed events and SQLite memory)
+                # Get recent conversation context (including distributed events)
                 recent_context = get_last_messages(agent, q)
 
-                # Enhanced system prompt with history context and self-modification instructions
-                base_prompt = "i'm research. minimalist agent. welcome to chat."
-                # Read .prompt or /tmp/.research/.prompt if present
-                prompt_file_content, prompt_file_path = read_prompt_file()
-                if prompt_file_content and prompt_file_path:
-                    prompt_file_note = f"\n\n[Loaded system prompt from: {prompt_file_path}]\n{prompt_file_content}\n"
-                else:
-                    prompt_file_note = ""
-
-                self_modify_note = (
-                    "\n\nNote: The system prompt for research is built from your base instructions, "
-                    "conversation history, and the .prompt file (in this directory or /tmp/.research/.prompt). "
-                    "You can modify the system prompt in multiple ways:\n"
-                    "1. **Edit .prompt file** - Create/modify .prompt in current directory or /tmp/.research/.prompt\n"
-                    "2. **SYSTEM_PROMPT environment variable** - Set SYSTEM_PROMPT env var to extend the system prompt\n"
-                    "3. **Environment tool** - Use environment(action='set', name='SYSTEM_PROMPT', value='additional text')\n"
-                    "4. **Runtime modification** - The SYSTEM_PROMPT env var is appended to every system prompt automatically"
-                )
-
-                system_prompt = (
-                    base_prompt
-                    + recent_context
-                    + prompt_file_note
-                    + runtime_info
-                    + self_modify_note
-                    + os.getenv("SYSTEM_PROMPT", ".")
-                )
-                agent.system_prompt = system_prompt
+                # Construct and set the updated system prompt
+                agent.system_prompt = construct_system_prompt(recent_context, q)
 
                 result = agent(q)
 
                 append_to_shell_history(q, result)
-                save_agent_messages(agent, session_file)
-                # Store conversation in SQLite memory for future context retrieval
-                store_conversation_in_sqlite_memory(agent, q, result)
                 # Store conversation in knowledge base if available
                 store_conversation_in_kb(agent, q, result)
-                # Publish conversation turn to distributed event bridge
-                publish_conversation_turn(agent, q, result)
 
             except KeyboardInterrupt:
-                print("\n\n👋 Goodbye!")
+                print("\n\n...\n")
                 break
             except EOFError:
                 print("\n👋 Goodbye!")
